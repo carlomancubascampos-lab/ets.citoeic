@@ -1,6 +1,8 @@
 import { env } from 'cloudflare:workers';
 import { NextRequest, NextResponse } from 'next/server';
 import { AdminAuthError, requireAdmin } from '@/lib/admin';
+import { productImageKeyFromUrl } from '@/lib/media';
+import { isSameOriginRequest } from '@/lib/request-security';
 import { defaultProducts } from '@/lib/site-data';
 import { generateTemporaryPassword, hashPassword } from '@/lib/security';
 
@@ -35,13 +37,16 @@ function integerValue(
 function safeImageUrl(value: unknown) {
   const candidate = optionalText(value, 500);
   if (!candidate) return null;
-  if (candidate.startsWith('/assets/')) return candidate;
+  if (candidate.startsWith('/assets/') || productImageKeyFromUrl(candidate)) {
+    return candidate;
+  }
   try {
     const url = new URL(candidate);
-    return url.protocol === 'https:' ? url.toString() : null;
+    if (url.protocol === 'https:') return url.toString();
   } catch {
-    return null;
+    // A clearer validation message is returned below.
   }
+  throw new Error('La imagen debe ser un enlace HTTPS válido.');
 }
 
 function optionalDate(value: unknown) {
@@ -58,11 +63,6 @@ function optionalDate(value: unknown) {
     throw new Error('La fecha de vigencia no es válida.');
   }
   return candidate;
-}
-
-function isSameOrigin(request: NextRequest) {
-  const origin = request.headers.get('origin');
-  return !origin || origin === new URL(request.url).origin;
 }
 
 function unauthorized(error: unknown) {
@@ -119,7 +119,7 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   try {
-    if (!isSameOrigin(request)) {
+    if (!isSameOriginRequest(request)) {
       return NextResponse.json(
         { error: 'Origen de solicitud no válido.' },
         { status: 403 },
@@ -249,6 +249,35 @@ export async function POST(request: NextRequest) {
       await env.DB.prepare('UPDATE products SET active = ? WHERE id = ?')
         .bind(active, id)
         .run();
+      return NextResponse.json({ ok: true });
+    }
+
+    if (action === 'deleteProduct') {
+      const id = integerValue(body.id, 'Plan', 1);
+      const product = await env.DB.prepare(
+        'SELECT image_url FROM products WHERE id = ?',
+      )
+        .bind(id)
+        .first<{ image_url: string | null }>();
+
+      if (!product) {
+        return NextResponse.json(
+          { error: 'Ese plan ya no existe.' },
+          { status: 404 },
+        );
+      }
+
+      await env.DB.prepare('DELETE FROM products WHERE id = ?').bind(id).run();
+
+      const imageKey = productImageKeyFromUrl(product.image_url);
+      if (imageKey) {
+        try {
+          await env.ASSETS.delete(imageKey);
+        } catch (error) {
+          console.error('No fue posible eliminar la imagen del plan.', error);
+        }
+      }
+
       return NextResponse.json({ ok: true });
     }
 

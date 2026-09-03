@@ -1,6 +1,11 @@
 'use client';
 
-import type { ComponentProps, ReactNode, SyntheticEvent } from 'react';
+import type {
+  ChangeEvent,
+  ComponentProps,
+  ReactNode,
+  SyntheticEvent,
+} from 'react';
 import { useCallback, useEffect, useState } from 'react';
 import {
   Check,
@@ -9,15 +14,28 @@ import {
   ExternalLink,
   LayoutDashboard,
   LoaderCircle,
+  ImagePlus,
   Package,
   Plus,
   RefreshCw,
   ShieldCheck,
+  Trash2,
   Users,
   WalletCards,
   X,
 } from 'lucide-react';
+import Image from 'next/image';
 import Link from 'next/link';
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -56,6 +74,7 @@ type ProductRow = {
   price_cents: number;
   currency: string;
   period: string;
+  image_url: string | null;
   stock: number;
   active: number;
 };
@@ -99,6 +118,26 @@ type AdminData = {
 };
 
 type Credentials = { username: string; temporaryPassword: string };
+type ActionResult = {
+  error?: string;
+  id?: number;
+  ok?: boolean;
+  username?: string;
+  temporaryPassword?: string;
+};
+type ProductNotice = {
+  tone: 'error' | 'success' | 'progress';
+  message: string;
+};
+type ProductStage = 'idle' | 'uploading' | 'publishing';
+
+const acceptedProductImages = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+]);
+const maxProductImageBytes = 5 * 1024 * 1024;
 
 const emptyData: AdminData = {
   products: [],
@@ -106,6 +145,25 @@ const emptyData: AdminData = {
   paymentMethods: [],
   recharges: [],
 };
+
+async function readJsonResponse<T>(response: Response): Promise<T> {
+  const raw = await response.text();
+  if (!raw) return {} as T;
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      response.redirected
+        ? 'Tu sesión venció. Vuelve a entrar al panel e inténtalo de nuevo.'
+        : 'El servidor respondió de forma inesperada. Intenta nuevamente.',
+    );
+  }
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
 
 export function AdminDashboard({ adminName }: { adminName: string }) {
   const [data, setData] = useState<AdminData>(emptyData);
@@ -116,11 +174,20 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
   const [clientOpen, setClientOpen] = useState(false);
   const [productOpen, setProductOpen] = useState(false);
   const [paymentOpen, setPaymentOpen] = useState(false);
+  const [productImageFile, setProductImageFile] = useState<File | null>(null);
+  const [productImagePreview, setProductImagePreview] = useState('');
+  const [uploadedProductImage, setUploadedProductImage] = useState('');
+  const [productNotice, setProductNotice] = useState<ProductNotice | null>(
+    null,
+  );
+  const [productStage, setProductStage] = useState<ProductStage>('idle');
 
   const load = useCallback(async () => {
     try {
       const response = await fetch('/api/admin', { cache: 'no-store' });
-      const result = (await response.json()) as AdminData & { error?: string };
+      const result = await readJsonResponse<AdminData & { error?: string }>(
+        response,
+      );
       if (!response.ok)
         throw new Error(result.error ?? 'No fue posible cargar los datos.');
       setData(result);
@@ -141,7 +208,17 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
     return () => window.clearTimeout(timer);
   }, [load]);
 
-  async function runAction(payload: Record<string, unknown>) {
+  useEffect(
+    () => () => {
+      if (productImagePreview) URL.revokeObjectURL(productImagePreview);
+    },
+    [productImagePreview],
+  );
+
+  async function runAction(
+    payload: Record<string, unknown>,
+    onError?: (message: string) => void,
+  ) {
     setBusy(true);
     setNotice('');
     try {
@@ -150,21 +227,15 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const result = (await response.json()) as {
-        error?: string;
-        username?: string;
-        temporaryPassword?: string;
-      };
+      const result = await readJsonResponse<ActionResult>(response);
       if (!response.ok)
         throw new Error(result.error ?? 'No fue posible guardar el cambio.');
-      await load();
+      void load();
       return result;
     } catch (error) {
-      setNotice(
-        error instanceof Error
-          ? error.message
-          : 'No fue posible guardar el cambio.',
-      );
+      const message = errorMessage(error, 'No fue posible guardar el cambio.');
+      setNotice(message);
+      onError?.(message);
       return null;
     } finally {
       setBusy(false);
@@ -196,21 +267,139 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
   async function createProduct(event: SyntheticEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const result = await runAction({
-      action: 'createProduct',
-      name: form.get('name'),
-      category: form.get('category'),
-      description: form.get('description'),
-      priceCents: Math.round(Number(form.get('price')) * 100),
-      currency: form.get('currency'),
-      period: form.get('period'),
-      badge: form.get('badge'),
-      accent: form.get('accent'),
-      imageUrl: form.get('imageUrl'),
-      stock: Number(form.get('stock')),
-      sortOrder: Number(form.get('sortOrder') || 0),
+    setProductNotice(null);
+
+    try {
+      const externalImageUrl = form.get('imageUrl');
+      let imageUrl =
+        typeof externalImageUrl === 'string' ? externalImageUrl.trim() : '';
+
+      if (productImageFile) {
+        if (uploadedProductImage) {
+          imageUrl = uploadedProductImage;
+        } else {
+          setProductStage('uploading');
+          setProductNotice({
+            tone: 'progress',
+            message: 'Subiendo la foto desde tu dispositivo…',
+          });
+          const upload = new FormData();
+          upload.set('file', productImageFile);
+          const uploadResponse = await fetch('/api/admin/uploads', {
+            method: 'POST',
+            body: upload,
+          });
+          const uploadResult = await readJsonResponse<{
+            error?: string;
+            url?: string;
+          }>(uploadResponse);
+          if (!uploadResponse.ok || !uploadResult.url) {
+            throw new Error(
+              uploadResult.error ?? 'No fue posible subir la imagen.',
+            );
+          }
+          imageUrl = uploadResult.url;
+          setUploadedProductImage(imageUrl);
+        }
+      }
+
+      setProductStage('publishing');
+      setProductNotice({
+        tone: 'progress',
+        message: 'Guardando el plan en el catálogo…',
+      });
+      const result = await runAction(
+        {
+          action: 'createProduct',
+          name: form.get('name'),
+          category: form.get('category'),
+          description: form.get('description'),
+          priceCents: Math.round(Number(form.get('price')) * 100),
+          currency: form.get('currency'),
+          period: form.get('period'),
+          badge: form.get('badge'),
+          accent: form.get('accent'),
+          imageUrl,
+          stock: Number(form.get('stock')),
+          sortOrder: Number(form.get('sortOrder') || 0),
+        },
+        (message) => setProductNotice({ tone: 'error', message }),
+      );
+      if (result) handleProductOpenChange(false);
+    } catch (error) {
+      const message = errorMessage(
+        error,
+        'No fue posible publicar el plan. Intenta nuevamente.',
+      );
+      setProductNotice({ tone: 'error', message });
+    } finally {
+      setProductStage('idle');
+    }
+  }
+
+  function handleProductImage(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    setProductNotice(null);
+    setUploadedProductImage('');
+
+    if (!file) {
+      setProductImageFile(null);
+      setProductImagePreview('');
+      return;
+    }
+    if (!acceptedProductImages.has(file.type.toLowerCase())) {
+      event.target.value = '';
+      setProductImageFile(null);
+      setProductImagePreview('');
+      setProductNotice({
+        tone: 'error',
+        message: 'Selecciona una imagen JPG, PNG, WEBP o GIF.',
+      });
+      return;
+    }
+    if (file.size > maxProductImageBytes) {
+      event.target.value = '';
+      setProductImageFile(null);
+      setProductImagePreview('');
+      setProductNotice({
+        tone: 'error',
+        message: 'La imagen no puede superar 5 MB.',
+      });
+      return;
+    }
+
+    setProductImageFile(file);
+    setProductImagePreview(URL.createObjectURL(file));
+    setProductNotice({
+      tone: 'success',
+      message: 'Foto lista. Se subirá cuando pulses “Publicar plan”.',
     });
-    if (result) setProductOpen(false);
+  }
+
+  function clearProductImage() {
+    setProductImageFile(null);
+    setProductImagePreview('');
+    setUploadedProductImage('');
+    setProductNotice(null);
+  }
+
+  function handleProductOpenChange(open: boolean) {
+    setProductOpen(open);
+    if (!open) clearProductImage();
+    if (open) setProductNotice(null);
+  }
+
+  async function deleteProduct(product: ProductRow) {
+    const result = await runAction({
+      action: 'deleteProduct',
+      id: product.id,
+    });
+    if (result) {
+      setData((current) => ({
+        ...current,
+        products: current.products.filter((item) => item.id !== product.id),
+      }));
+    }
   }
 
   async function createPayment(event: SyntheticEvent<HTMLFormElement>) {
@@ -530,7 +719,10 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
                       <LayoutDashboard /> Cargar catálogo base
                     </Button>
                   )}
-                  <Dialog open={productOpen} onOpenChange={setProductOpen}>
+                  <Dialog
+                    open={productOpen}
+                    onOpenChange={handleProductOpenChange}
+                  >
                     <DialogTrigger
                       render={
                         <Button className="rounded-full bg-primary font-black text-primary-foreground hover:bg-amber-300" />
@@ -618,8 +810,71 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
                           defaultValue="1"
                           required
                         />
+                        <div className="space-y-2 sm:col-span-2">
+                          <Label htmlFor="productImageFile">
+                            Subir foto desde mi dispositivo
+                          </Label>
+                          <label
+                            htmlFor="productImageFile"
+                            className="flex min-h-24 cursor-pointer items-center gap-4 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 transition hover:border-primary/60 hover:bg-primary/10"
+                          >
+                            <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-primary text-primary-foreground">
+                              <ImagePlus className="size-5" />
+                            </span>
+                            <span>
+                              <strong className="block text-sm">
+                                Elegir una foto
+                              </strong>
+                              <span className="mt-1 block text-xs text-zinc-500">
+                                JPG, PNG, WEBP o GIF · máximo 5 MB
+                              </span>
+                            </span>
+                            <Input
+                              id="productImageFile"
+                              type="file"
+                              accept="image/jpeg,image/png,image/webp,image/gif"
+                              onChange={handleProductImage}
+                              className="sr-only"
+                            />
+                          </label>
+                          {productImageFile && productImagePreview && (
+                            <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/25 p-3">
+                              <Image
+                                src={productImagePreview}
+                                alt="Vista previa de la foto seleccionada"
+                                className="size-16 rounded-xl object-cover"
+                                width={64}
+                                height={64}
+                                unoptimized
+                              />
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-sm font-bold">
+                                  {productImageFile.name}
+                                </p>
+                                <p className="mt-1 text-xs text-zinc-500">
+                                  {(
+                                    productImageFile.size /
+                                    1024 /
+                                    1024
+                                  ).toFixed(2)}{' '}
+                                  MB
+                                </p>
+                              </div>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                onClick={clearProductImage}
+                                disabled={productStage !== 'idle'}
+                                className="text-zinc-300 hover:text-white"
+                              >
+                                <X className="size-4" /> Quitar
+                              </Button>
+                            </div>
+                          )}
+                        </div>
                         <Field
-                          label="URL de imagen (opcional)"
+                          label="O pega una URL de imagen (opcional)"
                           name="imageUrl"
                           placeholder="https://…"
                         />
@@ -629,13 +884,39 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
                           type="number"
                           defaultValue="0"
                         />
+                        {productNotice && (
+                          <div
+                            className={`rounded-2xl border px-4 py-3 text-sm font-bold sm:col-span-2 ${
+                              productNotice.tone === 'error'
+                                ? 'border-red-400/20 bg-red-400/10 text-red-300'
+                                : productNotice.tone === 'success'
+                                  ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-300'
+                                  : 'border-primary/20 bg-primary/10 text-amber-200'
+                            }`}
+                            role={
+                              productNotice.tone === 'error'
+                                ? 'alert'
+                                : 'status'
+                            }
+                            aria-live="polite"
+                          >
+                            {productNotice.message}
+                          </div>
+                        )}
                         <div className="sm:col-span-2">
                           <Button
-                            disabled={busy}
+                            type="submit"
+                            disabled={busy || productStage !== 'idle'}
                             className="w-full bg-primary font-black text-primary-foreground hover:bg-amber-300"
                           >
-                            {busy && <LoaderCircle className="animate-spin" />}{' '}
-                            Publicar plan
+                            {(busy || productStage !== 'idle') && (
+                              <LoaderCircle className="animate-spin" />
+                            )}{' '}
+                            {productStage === 'uploading'
+                              ? 'Subiendo foto…'
+                              : productStage === 'publishing'
+                                ? 'Publicando…'
+                                : 'Publicar plan'}
                           </Button>
                         </div>
                       </form>
@@ -657,6 +938,7 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
                     <TableHead>Duración</TableHead>
                     <TableHead>Stock</TableHead>
                     <TableHead>Visible</TableHead>
+                    <TableHead className="text-right">Acciones</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -685,6 +967,44 @@ export function AdminDashboard({ adminName }: { adminName: string }) {
                           }
                           aria-label={`${product.active ? 'Ocultar' : 'Mostrar'} ${product.name}`}
                         />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <AlertDialog>
+                          <AlertDialogTrigger
+                            render={
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                disabled={busy}
+                                className="text-red-300 hover:bg-red-400/10 hover:text-red-200"
+                              />
+                            }
+                          >
+                            <Trash2 className="size-4" /> Eliminar
+                          </AlertDialogTrigger>
+                          <AlertDialogContent className="border-white/10 bg-card text-white">
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>
+                                ¿Eliminar “{product.name}”?
+                              </AlertDialogTitle>
+                              <AlertDialogDescription>
+                                El plan dejará de aparecer en la tienda y su
+                                foto subida también se eliminará. Esta acción no
+                                se puede deshacer.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancelar</AlertDialogCancel>
+                              <AlertDialogCancel
+                                variant="destructive"
+                                onClick={() => void deleteProduct(product)}
+                              >
+                                <Trash2 className="size-4" /> Sí, eliminar
+                              </AlertDialogCancel>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
                       </TableCell>
                     </TableRow>
                   ))}
